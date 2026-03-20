@@ -1,21 +1,20 @@
 #!/bin/bash
-# 部署脚本，放在服务器项目根目录
+set -e
+PROJ=/home/lzf/ai-boyfriend-unified
 
-# 拉取最新代码
-git pull
+echo "[1/4] 拉取最新代码..."
+cd $PROJ && git pull
 
-# 安装依赖（如有）
-if [ -f "package.json" ]; then
-  npm install
-fi
-if [ -f "pyproject.toml" ]; then
-  pip install -r requirements.txt || pip install .
-fi
+echo "[2/4] 安装 Node.js 依赖..."
+npm install --omit=dev
 
-# 启动服务（根据实际情况修改）
-# 例如：
-# pm2 restart app.js
-# 或
-# nohup python main.py &
+echo "[3/4] 安装 Python 依赖..."
+pip3 install fastapi "uvicorn[standard]" python-socketio supabase pyjwt \
+  bcrypt "passlib[bcrypt]" httpx python-dotenv pydantic-settings edge-tts \
+  apscheduler redis "pydantic[email]" python-jose python-multipart aiofiles -q
 
-echo "部署完成！"
+echo "[4/4] 重启服务..."
+sudo systemctl restart ai-boyfriend-node ai-boyfriend-python
+
+echo "✅ 部署完成！"
+systemctl is-active ai-boyfriend-node && systemctl is-active ai-boyfriend-python
