@@ -1,7 +1,6 @@
 import jwt from 'jsonwebtoken';
 import { supabase } from '../../services/supabase.js';
-
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+import { JWT_SECRET } from '../../config/secrets.js';
 
 // 生成 JWT token
 export function generateToken(userId) {

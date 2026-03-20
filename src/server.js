@@ -2,7 +2,9 @@ import express from 'express';
 import session from 'express-session';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import dotenv from 'dotenv';
+import http from 'http';
+
+import { SESSION_SECRET } from './config/secrets.js';
 
 // 导入路由
 import webRoutes from './web/routes/index.js';
@@ -11,7 +13,8 @@ import apiRoutes from './web/routes/api.js';
 // 导入 Discord 机器人
 import './discord/bot.js';
 
-dotenv.config();
+// 导入 WebSocket 管理器
+import wsManager from './services/websocket.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,7 +28,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // Session 配置
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'your-secret-key-change-in-production',
+  secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
   cookie: {
@@ -52,11 +55,27 @@ app.use((err, req, res, next) => {
   });
 });
 
+// 创建 HTTP 服务器
+const server = http.createServer(app);
+
+// 初始化 WebSocket
+wsManager.initialize(server);
+
 // 启动服务器
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📱 Web interface: http://localhost:${PORT}`);
+  console.log(`🔌 WebSocket server: ws://localhost:${PORT}/ws`);
   console.log(`🤖 Discord bot is starting...`);
+});
+
+// 优雅关闭
+process.on('SIGTERM', () => {
+  console.log('SIGTERM signal received: closing HTTP server');
+  wsManager.close();
+  server.close(() => {
+    console.log('HTTP server closed');
+  });
 });
 
 export default app;

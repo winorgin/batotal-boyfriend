@@ -119,7 +119,7 @@ CREEM_WEBHOOK_SECRET=your_webhook_secret
 # 服务器
 PORT=3000
 NODE_ENV=production
-SESSION_SECRET=your_session_secret
+SESSION_SECRET=replace_with_a_random_string_of_at_least_32_bytes
 ```
 
 ## 📱 使用方式
@@ -172,10 +172,10 @@ SESSION_SECRET=your_session_secret
 
 #### 用户认证
 ```
-POST /api/auth/register - 注册
-POST /api/auth/login - 登录
+POST /api/auth/register - 注册（username/email/password 必填）
+POST /api/auth/login - 登录（username/email/password 必填）
 POST /api/auth/logout - 登出
-GET /api/auth/profile - 获取用户信息
+GET /api/auth/me - 获取用户信息
 ```
 
 #### 聊天

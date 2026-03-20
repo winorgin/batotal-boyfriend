@@ -1,9 +1,11 @@
 import { saveChatMessage, updateIntimacy, checkCooldown, setCooldown, saveSoulMemory, getRecentMessages, getUserLanguagePreference, updateUserPreferences, detectLanguage } from '../../services/supabase.js';
 import { generateResponse } from '../../services/ai.js';
-import { analyzeEmotion } from '../../services/emotion.js';
-import { updatePersonality } from '../../services/personality.js';
+import { analyzeEmotion, transitionMoodState, checkSchedule } from '../../services/emotion.js';
+import { updatePersonality, getPersonalityState } from '../../services/personality.js';
+import { extractMemoriesFromConversation, retrieveRelevantMemories } from '../../services/memory.js';
 import { onMessageProcessed } from '../../services/soulUpdater.js';
 import { generateVoiceWithScene } from '../../services/voice.js';
+import wsManager from '../../services/websocket.js';
 
 // 发送消息
 export async function sendMessage(req, res) {
@@ -82,14 +84,36 @@ export async function sendMessage(req, res) {
       });
     }
     
-    // 保存用户消息
-    await saveChatMessage(user.id, 'web', message, true);
+    // 并行执行所有数据库查询和分析（性能优化）
+    const [
+      ,
+      emotion,
+      ,
+      { data: lastMessages },
+      relevantMemories,
+      personalityState,
+      { data: recentMessages }
+    ] = await Promise.all([
+      saveChatMessage(user.id, 'web', message, true),
+      analyzeEmotion(message),
+      checkSchedule(user.id),
+      getRecentMessages(user.id, 'web', 1),
+      retrieveRelevantMemories(user.id, message, 5),
+      getPersonalityState(user.id),
+      getRecentMessages(user.id, 'web', 10)
+    ]);
     
-    // 情感分析
-    const emotion = await analyzeEmotion(message);
+    // 计算距离上次互动的时间
+    const lastInteractionTime = lastMessages.length > 0 ? new Date(lastMessages[0].created_at) : null;
+    const hoursSinceLastInteraction = lastInteractionTime 
+      ? (Date.now() - lastInteractionTime.getTime()) / (1000 * 60 * 60)
+      : 0;
     
-    // 获取聊天历史
-    const { data: recentMessages } = await getRecentMessages(user.id, 'web', 10);
+    // 更新情绪状态（不阻塞主流程）
+    transitionMoodState(user.id, emotion, {
+      timeOfDay: true,
+      lastInteractionHours: hoursSinceLastInteraction
+    }).catch(err => console.error('情绪状态更新失败:', err));
     const chatHistory = recentMessages.map(msg => ({
       role: msg.is_user ? 'user' : 'assistant',
       content: msg.message
@@ -106,10 +130,14 @@ export async function sendMessage(req, res) {
     
     console.log(`[语言控制] 已为用户消息注入${languageName}语言提醒`);
     
-    // 生成回复（使用固定的语言偏好）
+    // 生成回复（使用固定的语言偏好和新的上下文）
     const aiResult = await generateResponse('web', chatHistory, {
-      emotion,
       username: user.username,
+      relationshipStage: user.relationship_stage || 'close_friend',
+      intimacyLevel: user.intimacy_level || 0,
+      personalityTraits: personalityState?.traits || {},
+      moodState: personalityState?.current_mood || 'neutral',
+      recentMemories: relevantMemories,
       userLanguage: userLanguage
     });
     
@@ -123,57 +151,124 @@ export async function sendMessage(req, res) {
     // 过滤掉所有括号及其内容
     const filteredContent = aiResult.content.replace(/[（(].*?[）)]/g, '').trim();
     
-    // 保存过滤后的 AI 回复
-    await saveChatMessage(user.id, 'web', filteredContent, false, null, emotion.primary, aiResult.tokensUsed);
-    
-    // 更新亲密度
+    // 计算亲密度变化
     let intimacyChange = 1;
     if (emotion.sentiment === 'positive') intimacyChange = 2;
     if (emotion.sentiment === 'negative') intimacyChange = -1;
     
-    const newIntimacy = await updateIntimacy(user.id, intimacyChange);
+    // 检查用户是否在线（使用 WebSocket）
+    const isOnline = wsManager.isUserOnline(user.id);
     
-    // 更新性格特征
-    await updatePersonality(user.id, emotion, message);
-    
-    // 保存重要记忆
-    if (emotion.intensity > 0.7 || message.length > 100) {
-      await saveSoulMemory(user.id, 'web', {
-        content: message,
-        emotion: emotion.primary,
-        context: '重要对话',
-        importance: emotion.intensity
+    if (isOnline) {
+      // WebSocket 模式：立即返回确认，后台处理并推送
+      console.log(`[WebSocket] 用户 ${user.username} 在线，使用实时推送模式`);
+      
+      // 立即返回确认响应（< 500ms）
+      res.json({
+        success: true,
+        mode: 'websocket',
+        message: '消息已接收，正在处理中...'
+      });
+      
+      // 发送"正在输入"状态
+      wsManager.sendTypingStatus(user.id, true);
+      
+      // 后台处理并通过 WebSocket 推送结果
+      (async () => {
+        try {
+          // 并行执行关键操作
+          const [, newIntimacy] = await Promise.all([
+            saveChatMessage(user.id, 'web', filteredContent, false, null, emotion.primary, aiResult.tokensUsed),
+            updateIntimacy(user.id, intimacyChange),
+            setCooldown(user.id, 'web', 3)
+          ]);
+          
+          // 停止"正在输入"状态
+          wsManager.sendTypingStatus(user.id, false);
+          
+          // 推送 AI 响应
+          wsManager.sendAIResponse(user.id, filteredContent, emotion.primary);
+          
+          // 推送亲密度更新
+          wsManager.sendIntimacyUpdate(user.id, intimacyChange, newIntimacy);
+          
+          // 后台异步任务
+          Promise.all([
+            updatePersonality(user.id, emotion, message),
+            extractMemoriesFromConversation(user.id, message, filteredContent, emotion).catch(err => 
+              console.error('记忆提取失败:', err)
+            ),
+            (emotion.intensity > 0.7 || message.length > 100) 
+              ? saveSoulMemory(user.id, 'web', {
+                  content: message,
+                  emotion: emotion.primary,
+                  context: '重要对话',
+                  importance: emotion.intensity
+                })
+              : Promise.resolve(),
+            onMessageProcessed(user.id, user.total_messages || 0)
+          ]).catch(err => console.error('后台任务失败:', err));
+          
+          // 语音生成完全异步，完成后推送
+          generateVoiceWithScene(filteredContent).then(voiceResult => {
+            if (voiceResult.success) {
+              console.log('语音生成成功，推送给用户:', voiceResult.audioUrl);
+              wsManager.sendVoiceReady(user.id, voiceResult.audioUrl);
+            }
+          }).catch(err => console.error('语音生成失败:', err));
+          
+        } catch (error) {
+          console.error('[WebSocket] 后台处理失败:', error);
+          wsManager.sendError(user.id, '处理消息时出错', 'PROCESSING_ERROR');
+        }
+      })();
+      
+    } else {
+      // 传统模式：等待所有处理完成后返回（兼容性）
+      console.log(`[传统模式] 用户 ${user.username} 离线，使用同步响应模式`);
+      
+      // 并行执行关键操作
+      const [, newIntimacy] = await Promise.all([
+        saveChatMessage(user.id, 'web', filteredContent, false, null, emotion.primary, aiResult.tokensUsed),
+        updateIntimacy(user.id, intimacyChange),
+        setCooldown(user.id, 'web', 3)
+      ]);
+      
+      // 后台异步任务（不阻塞响应）
+      Promise.all([
+        updatePersonality(user.id, emotion, message),
+        extractMemoriesFromConversation(user.id, message, filteredContent, emotion).catch(err => 
+          console.error('记忆提取失败:', err)
+        ),
+        (emotion.intensity > 0.7 || message.length > 100) 
+          ? saveSoulMemory(user.id, 'web', {
+              content: message,
+              emotion: emotion.primary,
+              context: '重要对话',
+              importance: emotion.intensity
+            })
+          : Promise.resolve(),
+        onMessageProcessed(user.id, user.total_messages || 0)
+      ]).catch(err => console.error('后台任务失败:', err));
+      
+      // 语音生成完全异步（不等待结果）
+      let audioUrl = null;
+      generateVoiceWithScene(filteredContent).then(voiceResult => {
+        if (voiceResult.success) {
+          console.log('语音生成成功:', voiceResult.audioUrl);
+        }
+      }).catch(err => console.error('语音生成失败:', err));
+      
+      res.json({
+        success: true,
+        mode: 'traditional',
+        response: filteredContent,
+        audioUrl,
+        intimacyChange,
+        newIntimacy,
+        emotion: emotion.primary
       });
     }
-    
-    // 设置冷却时间（3秒）
-    await setCooldown(user.id, 'web', 3);
-    
-    // 生成语音（异步，不阻塞响应）
-    let audioUrl = null;
-    try {
-      const voiceResult = await generateVoiceWithScene(aiResult.content);
-      if (voiceResult.success) {
-        audioUrl = voiceResult.audioUrl;
-      }
-    } catch (voiceError) {
-      console.error('语音生成失败:', voiceError);
-      // 语音生成失败不影响主流程
-    }
-    
-    // 触发 Soul 自动更新检查
-    onMessageProcessed(user.id, user.total_messages || 0).catch(err => {
-      console.error('Soul 更新检查失败:', err);
-    });
-    
-    res.json({
-      success: true,
-      response: filteredContent,
-      audioUrl,
-      intimacyChange,
-      newIntimacy,
-      emotion: emotion.primary
-    });
   } catch (error) {
     console.error('Send message error:', error);
     res.status(500).json({ success: false, error: '发送消息失败' });

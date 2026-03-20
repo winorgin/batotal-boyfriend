@@ -2,6 +2,12 @@
 let currentUser = null;
 const API_BASE = '/api';
 
+// WebSocket 相关变量
+let ws = null;
+let wsReconnectAttempts = 0;
+const WS_MAX_RECONNECT_ATTEMPTS = 5;
+const WS_RECONNECT_DELAY = 3000;
+
 // 语音相关变量
 let mediaRecorder = null;
 let audioChunks = [];
@@ -14,6 +20,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     await loadUserInfo();
     await loadChatHistory();
     setupVoiceButton();
+    initWebSocket(); // 初始化 WebSocket
     
     // 加载语音列表
     if (synthesis) {
@@ -103,6 +110,157 @@ async function loadChatHistory() {
     }
 }
 
+// ========== WebSocket 功能 ==========
+
+// 初始化 WebSocket 连接
+function initWebSocket() {
+    const token = localStorage.getItem('token');
+    if (!token) {
+        console.log('[WebSocket] 未找到 token，跳过连接');
+        return;
+    }
+    
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/ws?token=${token}`;
+    
+    try {
+        ws = new WebSocket(wsUrl);
+        
+        ws.onopen = () => {
+            console.log('[WebSocket] 连接已建立');
+            wsReconnectAttempts = 0;
+            showNotification('🔌 实时连接已建立');
+        };
+        
+        ws.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                handleWebSocketMessage(data);
+            } catch (error) {
+                console.error('[WebSocket] 消息解析失败:', error);
+            }
+        };
+        
+        ws.onerror = (error) => {
+            console.error('[WebSocket] 连接错误:', error);
+        };
+        
+        ws.onclose = () => {
+            console.log('[WebSocket] 连接已关闭');
+            ws = null;
+            
+            // 尝试重连
+            if (wsReconnectAttempts < WS_MAX_RECONNECT_ATTEMPTS) {
+                wsReconnectAttempts++;
+                console.log(`[WebSocket] ${WS_RECONNECT_DELAY/1000}秒后尝试重连 (${wsReconnectAttempts}/${WS_MAX_RECONNECT_ATTEMPTS})`);
+                setTimeout(initWebSocket, WS_RECONNECT_DELAY);
+            } else {
+                console.log('[WebSocket] 已达到最大重连次数，停止重连');
+                showError('实时连接已断开，请刷新页面');
+            }
+        };
+        
+    } catch (error) {
+        console.error('[WebSocket] 初始化失败:', error);
+    }
+}
+
+// 处理 WebSocket 消息
+function handleWebSocketMessage(data) {
+    console.log('[WebSocket] 收到消息:', data.type);
+    
+    switch (data.type) {
+        case 'connected':
+            console.log('[WebSocket] 服务器确认连接');
+            break;
+            
+        case 'typing':
+            if (data.isTyping) {
+                showTypingIndicator('zh');
+            } else {
+                hideTypingIndicator();
+            }
+            break;
+            
+        case 'ai_response':
+            hideTypingIndicator();
+            addMessageToUI('assistant', data.content);
+            break;
+            
+        case 'voice_ready':
+            // 为最后一条 AI 消息添加语音播放按钮
+            addVoiceButtonToLastMessage(data.audioUrl);
+            break;
+            
+        case 'intimacy_update':
+            document.getElementById('intimacy').textContent = data.newIntimacy;
+            showIntimacyChange(data.intimacyChange);
+            loadUserInfo(); // 重新加载用户信息
+            break;
+            
+        case 'error':
+            hideTypingIndicator();
+            showError(data.error);
+            break;
+            
+        case 'pong':
+            // 心跳响应
+            break;
+            
+        default:
+            console.log('[WebSocket] 未知消息类型:', data.type);
+    }
+}
+
+// 为最后一条消息添加语音按钮
+function addVoiceButtonToLastMessage(audioUrl) {
+    const messages = document.querySelectorAll('.message.assistant');
+    if (messages.length === 0) return;
+    
+    const lastMessage = messages[messages.length - 1];
+    
+    // 检查是否已经有语音按钮
+    if (lastMessage.querySelector('.voice-play-btn')) return;
+    
+    // 添加语音消息样式
+    lastMessage.classList.add('voice-message');
+    
+    // 创建消息头部（如果不存在）
+    let headerEl = lastMessage.querySelector('.message-header');
+    if (!headerEl) {
+        headerEl = document.createElement('div');
+        headerEl.className = 'message-header';
+        
+        const avatarEl = document.createElement('div');
+        avatarEl.className = 'message-avatar';
+        const img = document.createElement('img');
+        img.src = '/images/Elio.avif';
+        img.alt = 'Elio';
+        img.style.width = '100%';
+        img.style.height = '100%';
+        img.style.objectFit = 'cover';
+        avatarEl.appendChild(img);
+        
+        const senderEl = document.createElement('span');
+        senderEl.className = 'message-sender';
+        senderEl.textContent = 'Elio';
+        
+        headerEl.appendChild(avatarEl);
+        headerEl.appendChild(senderEl);
+        
+        lastMessage.insertBefore(headerEl, lastMessage.firstChild);
+    }
+    
+    // 添加播放按钮
+    const playBtn = document.createElement('button');
+    playBtn.className = 'voice-play-btn';
+    playBtn.innerHTML = '🔊';
+    playBtn.onclick = () => playVoiceMessage(audioUrl, playBtn);
+    headerEl.appendChild(playBtn);
+    
+    console.log('[WebSocket] 语音按钮已添加到最后一条消息');
+}
+
 // 检测消息语言
 function detectLanguage(text) {
     const chineseRegex = /[\u4e00-\u9fa5]/;
@@ -152,31 +310,32 @@ async function sendMessage() {
         
         const data = await response.json();
         
-        // 隐藏"正在输入"提示
-        hideTypingIndicator();
-        
         if (data.success) {
-            // 添加AI回复到UI，如果有语音URL则添加播放按钮
-            if (data.audioUrl) {
-                addMessageWithAudioToUI('assistant', data.response, data.audioUrl);
+            if (data.mode === 'websocket') {
+                // WebSocket 模式：消息已通过 WebSocket 推送，无需额外处理
+                console.log('[WebSocket] 使用实时推送模式');
+                // 保持"正在输入"提示，等待 WebSocket 推送
             } else {
-                addMessageToUI('assistant', data.response);
+                // 传统模式：直接处理响应
+                console.log('[传统模式] 使用同步响应模式');
+                hideTypingIndicator();
+                
+                if (data.audioUrl) {
+                    addMessageWithAudioToUI('assistant', data.response, data.audioUrl);
+                } else {
+                    addMessageToUI('assistant', data.response);
+                }
+                
+                if (data.intimacyChange) {
+                    document.getElementById('intimacy').textContent = data.newIntimacy;
+                    showIntimacyChange(data.intimacyChange);
+                }
+                
+                await loadUserInfo();
             }
-            
-            // 更新亲密度显示
-            if (data.intimacyChange) {
-                document.getElementById('intimacy').textContent = data.newIntimacy;
-                showIntimacyChange(data.intimacyChange);
-            }
-            
-            // 重新加载用户信息
-            await loadUserInfo();
         } else {
-            if (data.cooldown) {
-                showError(`请等待 ${data.cooldown} 秒`);
-            } else {
-                showError(data.error || '发送失败');
-            }
+            hideTypingIndicator();
+            showError(data.error || data.message || '发送失败');
         }
     } catch (error) {
         hideTypingIndicator();
@@ -205,6 +364,7 @@ function addMessageToUI(role, content, scroll = true) {
 
 // 添加带语音的消息到UI
 function addMessageWithAudioToUI(role, content, audioUrl, scroll = true) {
+    const messagesDiv = document.getElementById('messages');
     const messageEl = document.createElement('div');
     messageEl.className = `message ${role} voice-message`;
     
@@ -250,7 +410,7 @@ function addMessageWithAudioToUI(role, content, audioUrl, scroll = true) {
     messagesDiv.appendChild(messageEl);
     
     if (scroll) {
-        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        scrollToBottom();
     }
 }
 
@@ -729,11 +889,7 @@ async function sendTextToAI(text) {
             
             await loadUserInfo();
         } else {
-            if (data.cooldown) {
-                showError(`请等待 ${data.cooldown} 秒`);
-            } else {
-                showError(data.error || '发送失败');
-            }
+            showError(data.error || data.message || '发送失败');
         }
     } catch (error) {
         console.error('发送消息失败:', error);
